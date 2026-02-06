@@ -1,0 +1,63 @@
+---
+import BaseLayout from '../layouts/BaseLayout.astro';
+---
+<BaseLayout title="注册 | 智聊协作平台">
+  <section class="card">
+    <h1>注册</h1>
+    <p class="helper">创建新账号以加入聊天室。</p>
+    <form class="form" id="register-form">
+      <div>
+        <label for="username">用户名</label>
+        <input id="username" name="username" type="text" required />
+      </div>
+      <div>
+        <label for="password">密码</label>
+        <input id="password" name="password" type="password" required />
+      </div>
+      <div>
+        <label for="confirmPassword">确认密码</label>
+        <input id="confirmPassword" name="confirmPassword" type="password" required />
+      </div>
+      <button class="button" type="submit">注册并登录</button>
+      <p class="helper">已有账号？<a href="/login">去登录</a></p>
+      <div class="error" id="error" hidden></div>
+    </form>
+  </section>
+  <script type="module">
+    const form = document.getElementById('register-form');
+    const errorBox = document.getElementById('error');
+    const apiBase = import.meta.env.PUBLIC_API_BASE ?? 'http://localhost:8080';
+
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      errorBox.hidden = true;
+
+      const payload = {
+        username: form.username.value.trim(),
+        password: form.password.value,
+        confirmPassword: form.confirmPassword.value,
+      };
+
+      try {
+        const response = await fetch(`${apiBase}/api/register`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(payload),
+        });
+
+        const data = await response.json();
+        if (!response.ok) {
+          throw new Error(data.error || '注册失败');
+        }
+        localStorage.setItem('authToken', data.token);
+        localStorage.setItem('username', data.username);
+        window.location.href = '/chat';
+      } catch (err) {
+        errorBox.textContent = err.message;
+        errorBox.hidden = false;
+      }
+    });
+  </script>
+</BaseLayout>

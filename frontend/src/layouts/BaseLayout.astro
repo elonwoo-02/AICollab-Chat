@@ -1,0 +1,32 @@
+---
+import '../styles/global.css';
+const { title } = Astro.props;
+---
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>{title}</title>
+  </head>
+  <body>
+    <header class="header">
+      <div class="container">
+        <div>
+          <strong>智聊协作平台</strong>
+        </div>
+        <nav class="nav">
+          <a href="/">首页</a>
+          <a href="/login">登录</a>
+          <a href="/register">注册</a>
+          <a href="/chat">聊天室</a>
+        </nav>
+      </div>
+    </header>
+    <main>
+      <div class="container">
+        <slot />
+      </div>
+    </main>
+  </body>
+</html>

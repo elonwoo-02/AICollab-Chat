@@ -1,0 +1,58 @@
+---
+import BaseLayout from '../layouts/BaseLayout.astro';
+---
+<BaseLayout title="登录 | 智聊协作平台">
+  <section class="card">
+    <h1>登录</h1>
+    <p class="helper">使用用户名与密码登录后即可进入聊天室。</p>
+    <form class="form" id="login-form">
+      <div>
+        <label for="username">用户名</label>
+        <input id="username" name="username" type="text" required />
+      </div>
+      <div>
+        <label for="password">密码</label>
+        <input id="password" name="password" type="password" required />
+      </div>
+      <button class="button" type="submit">登录</button>
+      <p class="helper">还没有账号？<a href="/register">去注册</a></p>
+      <div class="error" id="error" hidden></div>
+    </form>
+  </section>
+  <script type="module">
+    const form = document.getElementById('login-form');
+    const errorBox = document.getElementById('error');
+    const apiBase = import.meta.env.PUBLIC_API_BASE ?? 'http://localhost:8080';
+
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      errorBox.hidden = true;
+
+      const payload = {
+        username: form.username.value.trim(),
+        password: form.password.value,
+      };
+
+      try {
+        const response = await fetch(`${apiBase}/api/login`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(payload),
+        });
+
+        const data = await response.json();
+        if (!response.ok) {
+          throw new Error(data.error || '登录失败');
+        }
+        localStorage.setItem('authToken', data.token);
+        localStorage.setItem('username', data.username);
+        window.location.href = '/chat';
+      } catch (err) {
+        errorBox.textContent = err.message;
+        errorBox.hidden = false;
+      }
+    });
+  </script>
+</BaseLayout>
