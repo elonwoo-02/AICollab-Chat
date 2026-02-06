@@ -109,50 +109,25 @@ go get -u github.com/gorilla/websocket
 ```
 
 #### 数据库配置
-确保您的MySQL数据库已设置并运行。
-建立chatroom数据库
-``` sql
-CREATE DATABASE chatroom;
+默认使用内存存储，适合快速启动。若需要持久化，请先准备好 MySQL 数据库，并设置环境变量 `CHATROOM_DB_DSN`，例如：
+``` bash
+export CHATROOM_DB_DSN="user:password@tcp(localhost:3306)/chatroom?parseTime=true"
 ```
-并在其中创建users和messages表:
-``` sql
-USE chatroom;
-CREATE TABLE users (
-    id INT AUTO_INCREMENT PRIMARY KEY,
-    username VARCHAR(255) UNIQUE NOT NULL,
-    password VARCHAR(255) NOT NULL
-);
-
-CREATE TABLE messages (
-    id INT AUTO_INCREMENT PRIMARY KEY,
-    sender VARCHAR(255) NOT NULL,
-    message TEXT NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
-
-USE chatroom;
-SHOW TABLES;
-SELECT * FROM users;
-SELECT * FROM messages;
-```
-
-将main.go:39行配置成自己的mysql数据库
-``` go
-db, err := sql.Open("mysql", "user:password@tcp(username:port)/chatroom")
-```
+服务启动时会自动创建 `users` 和 `messages` 表（如不存在）。
 
 #### 添加静态文件
 如果你想在项目中添加自己的静态文件，确保你的静态文件（CSS、JavaScript、图片等）位于正确的目录中。
 代码将静态文件目录设置为./static，你还需要确保模板文件位于名为templates的目录中。
 
 #### api key
-在代码第41行填入gpt api key
-``` go
-const (
-	openaiURL    = "https://api.openai.com/v1/chat/completions"
-	openaiAPIKey = ""
-) 
+通过环境变量提供 OpenAI Key：
+``` bash
+export OPENAI_API_KEY="your_api_key"
+```
+可选配置：
+``` bash
+export OPENAI_API_URL="https://api.openai.com/v1/chat/completions"
+export OPENAI_MODEL="gpt-3.5-turbo"
 ```
 #### 编译运行
 1. 在浏览器中输入[http://localhost:8080](http://localhost:8080)查看是否正常启动；
@@ -172,14 +147,11 @@ const (
 
 #### v0.0.2 支持接入chat-gpt
 
-利用api调用chatgpt的[代码示例](chatgpt)；
+利用 API 调用 chatgpt 的[代码示例](chatgpt)；
 
-在main.go第41行填入gpt api key
-``` go
-const (
-	openaiURL    = "https://api.openai.com/v1/chat/completions"
-	openaiAPIKey = ""
-) 
+通过环境变量注入 API Key：
+``` bash
+export OPENAI_API_KEY="your_api_key"
 ```
 
 ##### 问题：

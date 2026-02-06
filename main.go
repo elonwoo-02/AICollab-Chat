@@ -1,44 +1,37 @@
 package main
 
 import (
-	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log"
 	"net/http"
-	"net/url"
+	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/gorilla/websocket"
+	"golang.org/x/crypto/bcrypt"
 )
 
-var (
-	upgrader = websocket.Upgrader{
-		ReadBufferSize:  1024,
-		WriteBufferSize: 1024,
-	}
-	msgChan = make(chan UserMessage) // 定义全局的消息通道
-
-	// 建立一个WebSocket连接的映射，并使用互斥锁进行保护
-	conns = struct {
-		sync.RWMutex
-		m map[*websocket.Conn]string
-	}{m: make(map[*websocket.Conn]string)}
-)
-
-const (
-	openaiURL    = "https://api.openai.com/v1/chat/completions"
-	openaiAPIKey = ""
-)
+type Config struct {
+	Addr        string
+	DBDSN       string
+	OpenAIKey   string
+	OpenAIURL   string
+	OpenAIModel string
+}
 
 type UserMessage struct {
 	Sender  string
 	Content string
+	Display string
 }
 
 type Message struct {
@@ -52,56 +45,219 @@ type RequestBody struct {
 }
 
 type ResponseBody struct {
-	ID      string `json:"id"`
-	Object  string `json:"object"`
-	Created int    `json:"created"`
 	Choices []struct {
-		Index        int    `json:"index"`
-		FinishReason string `json:"finish_reason"`
-		Message      Message
+		Message Message `json:"message"`
 	} `json:"choices"`
-	Usage struct {
-		PromptTokens     int `json:"prompt_tokens"`
-		CompletionTokens int `json:"completion_tokens"`
-		TotalTokens      int `json:"total_tokens"`
-	} `json:"usage"`
 }
 
-func main() {
-	// 打开一个数据库连接
-	db, err := sql.Open("mysql", "user:password@tcp(localhost:3306)/chatroom")
+type Store interface {
+	CreateUser(ctx context.Context, username, passwordHash string) error
+	GetUserPassword(ctx context.Context, username string) (string, error)
+	SaveMessage(ctx context.Context, sender, message string) error
+}
+
+type MemoryStore struct {
+	mu       sync.RWMutex
+	users    map[string]string
+	messages []UserMessage
+}
+
+func NewMemoryStore() *MemoryStore {
+	return &MemoryStore{users: make(map[string]string)}
+}
+
+func (m *MemoryStore) CreateUser(_ context.Context, username, passwordHash string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, exists := m.users[username]; exists {
+		return fmt.Errorf("user already exists")
+	}
+	m.users[username] = passwordHash
+	return nil
+}
+
+func (m *MemoryStore) GetUserPassword(_ context.Context, username string) (string, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	password, exists := m.users[username]
+	if !exists {
+		return "", sql.ErrNoRows
+	}
+	return password, nil
+}
+
+func (m *MemoryStore) SaveMessage(_ context.Context, sender, message string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.messages = append(m.messages, UserMessage{Sender: sender, Content: message})
+	return nil
+}
+
+type MySQLStore struct {
+	db *sql.DB
+}
+
+func NewMySQLStore(dsn string) (*MySQLStore, error) {
+	db, err := sql.Open("mysql", dsn)
 	if err != nil {
-		fmt.Println(err)
-		return
+		return nil, err
 	}
 
-	// Close the database connection
-	defer db.Close()
-
-	// Test the database connection
-	err = db.Ping()
-	if err != nil {
-		fmt.Println(err)
-		return
+	if err := db.Ping(); err != nil {
+		return nil, err
 	}
 
-	fmt.Println("Connected to MySQL database!")
-	// 打开一个路由
-	router := gin.Default()
-	router.LoadHTMLGlob("templates/*.html")
-	router.Static("/static", "./static")
+	store := &MySQLStore{db: db}
+	if err := store.ensureTables(); err != nil {
+		return nil, err
+	}
+	return store, nil
+}
 
-	router.GET("/", func(c *gin.Context) {
+func (m *MySQLStore) ensureTables() error {
+	userTable := `CREATE TABLE IF NOT EXISTS users (
+		id INT AUTO_INCREMENT PRIMARY KEY,
+		username VARCHAR(255) UNIQUE NOT NULL,
+		password VARCHAR(255) NOT NULL
+	);`
+	messageTable := `CREATE TABLE IF NOT EXISTS messages (
+		id INT AUTO_INCREMENT PRIMARY KEY,
+		sender VARCHAR(255) NOT NULL,
+		message TEXT NOT NULL,
+		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+	);`
+
+	if _, err := m.db.Exec(userTable); err != nil {
+		return err
+	}
+	if _, err := m.db.Exec(messageTable); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (m *MySQLStore) CreateUser(ctx context.Context, username, passwordHash string) error {
+	_, err := m.db.ExecContext(ctx, "INSERT INTO users (username, password) VALUES (?, ?)", username, passwordHash)
+	return err
+}
+
+func (m *MySQLStore) GetUserPassword(ctx context.Context, username string) (string, error) {
+	var password string
+	err := m.db.QueryRowContext(ctx, "SELECT password FROM users WHERE username = ?", username).Scan(&password)
+	return password, err
+}
+
+func (m *MySQLStore) SaveMessage(ctx context.Context, sender, message string) error {
+	_, err := m.db.ExecContext(ctx, "INSERT INTO messages (sender, message) VALUES (?, ?)", sender, message)
+	return err
+}
+
+type OpenAIClient struct {
+	apiKey string
+	url    string
+	model  string
+	client *http.Client
+}
+
+func NewOpenAIClient(cfg Config) *OpenAIClient {
+	return &OpenAIClient{
+		apiKey: cfg.OpenAIKey,
+		url:    cfg.OpenAIURL,
+		model:  cfg.OpenAIModel,
+		client: &http.Client{Timeout: 30 * time.Second},
+	}
+}
+
+func (o *OpenAIClient) Enabled() bool {
+	return o != nil && o.apiKey != ""
+}
+
+func (o *OpenAIClient) Chat(ctx context.Context, msg string) (string, error) {
+	if !o.Enabled() {
+		return "", errors.New("openai api key not configured")
+	}
+
+	reqBody := RequestBody{
+		Model: o.model,
+		Messages: []Message{
+			{Role: "user", Content: msg},
+		},
+	}
+
+	payload, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, o.url, strings.NewReader(string(payload)))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+o.apiKey)
+
+	resp, err := o.client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("openai error: %s", strings.TrimSpace(string(body)))
+	}
+
+	var respBody ResponseBody
+	if err := json.Unmarshal(body, &respBody); err != nil {
+		return "", err
+	}
+	if len(respBody.Choices) == 0 {
+		return "", errors.New("openai response missing choices")
+	}
+	return strings.TrimSpace(respBody.Choices[0].Message.Content), nil
+}
+
+type App struct {
+	router   *gin.Engine
+	store    Store
+	aiClient *OpenAIClient
+	msgChan  chan UserMessage
+	mu       sync.RWMutex
+	conns    map[*websocket.Conn]string
+}
+
+func NewApp(store Store, aiClient *OpenAIClient) *App {
+	if aiClient == nil {
+		aiClient = &OpenAIClient{}
+	}
+	app := &App{
+		router:   gin.Default(),
+		store:    store,
+		aiClient: aiClient,
+		msgChan:  make(chan UserMessage, 32),
+		conns:    make(map[*websocket.Conn]string),
+	}
+	app.registerRoutes()
+	return app
+}
+
+func (a *App) registerRoutes() {
+	a.router.LoadHTMLGlob("templates/*.html")
+	a.router.Static("/static", "./static")
+
+	a.router.GET("/", func(c *gin.Context) {
 		c.HTML(http.StatusOK, "index.html", nil)
 	})
 
-	// sign in Interface
-	router.GET("/login", func(c *gin.Context) {
+	a.router.GET("/login", func(c *gin.Context) {
 		c.HTML(http.StatusOK, "login.html", nil)
 	})
 
-	router.POST("/login", func(c *gin.Context) {
-		username := c.PostForm("username")
+	a.router.POST("/login", func(c *gin.Context) {
+		username := strings.TrimSpace(c.PostForm("username"))
 		password := c.PostForm("password")
 
 		if username == "" || password == "" {
@@ -109,272 +265,260 @@ func main() {
 			return
 		}
 
-		// 查询用户信息
-		var storedPassword string
-		query := "SELECT password FROM users WHERE username = ?"
-		err := db.QueryRow(query, username).Scan(&storedPassword)
+		storedPassword, err := a.store.GetUserPassword(c.Request.Context(), username)
 		if err != nil {
-			if err == sql.ErrNoRows {
+			if errors.Is(err, sql.ErrNoRows) {
 				c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid username or password"})
-			} else {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to query user information"})
+				return
 			}
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to query user information"})
 			return
 		}
 
-		// 验证用户密码
-		if password != storedPassword {
+		if !checkPassword(storedPassword, password) {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid username or password"})
 			return
 		}
 
-		// 设置Cookie
-		usernameCookie := http.Cookie{
-			Name:  "username",
-			Value: username,
-			Path:  "/",
-		}
-		http.SetCookie(c.Writer, &usernameCookie)
-
+		setUsernameCookie(c, username)
 		c.Redirect(http.StatusMovedPermanently, "/chat")
 	})
 
-	// sign up 	Interface
-	router.GET("/register", func(c *gin.Context) {
+	a.router.GET("/register", func(c *gin.Context) {
 		c.HTML(http.StatusOK, "register.html", nil)
 	})
 
-	router.POST("/register", func(c *gin.Context) {
-		username := c.PostForm("username")
+	a.router.POST("/register", func(c *gin.Context) {
+		username := strings.TrimSpace(c.PostForm("username"))
 		password := c.PostForm("password")
-		confirm_password := c.PostForm("confirm_password")
+		confirmPassword := c.PostForm("confirm_password")
 
-		// 判断用户名和密码是否为空
-		if username == "" || password == "" || confirm_password == "" {
+		if username == "" || password == "" || confirmPassword == "" {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Username and password are required"})
 			return
 		}
-		// 判断密码是否一致
-		if password != confirm_password {
+		if password != confirmPassword {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Passwords do not match"})
 			return
 		}
 
-		// 将用户注册信息保存到数据库中
-		insertQuery := "INSERT INTO users (username, password) VALUES (?, ?);"
-		_, err := db.Exec(insertQuery, username, password)
+		passwordHash, err := hashPassword(password)
 		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to secure password"})
+			return
+		}
+
+		if err := a.store.CreateUser(c.Request.Context(), username, passwordHash); err != nil {
+			if strings.Contains(err.Error(), "exists") {
+				c.JSON(http.StatusConflict, gin.H{"error": "User already exists"})
+				return
+			}
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to register user"})
 			return
 		}
-		// 设置Cookie
-		usernameCookie := http.Cookie{
-			Name:  "username",
-			Value: username,
-			Path:  "/",
-		}
-		http.SetCookie(c.Writer, &usernameCookie)
-		// 注册成功，跳转到聊天室页面
+
+		setUsernameCookie(c, username)
 		c.Redirect(http.StatusMovedPermanently, "/chat")
 	})
 
-	// chat Interface
-	router.GET("/chat", func(c *gin.Context) {
+	a.router.GET("/chat", func(c *gin.Context) {
+		if _, err := c.Request.Cookie("username"); err != nil {
+			c.Redirect(http.StatusFound, "/login")
+			return
+		}
 		c.HTML(http.StatusOK, "chat.html", nil)
 	})
 
-	//
-	router.GET("/ws", func(c *gin.Context) {
-		wshandler(c.Writer, c.Request)
+	a.router.GET("/ws", func(c *gin.Context) {
+		a.handleWebSocket(c.Writer, c.Request)
 	})
-
-	// 在 main 函数中启动消息广播和消息保存到数据库的协程
-	go func() {
-		for {
-			msg := <-msgChan
-
-			// 将消息存储到数据库中
-			insertQuery := "INSERT INTO messages (sender, message) VALUES (?, ?)"
-			_, err := db.Exec(insertQuery, msg.Sender, msg.Content)
-			if err != nil {
-				fmt.Printf("Failed to insert message to database: %v", err)
-				continue
-			}
-
-			// 广播消息给所有连接的 WebSocket 客户端
-			conns.RLock()
-			for conn := range conns.m {
-				if err := conn.WriteMessage(websocket.TextMessage, []byte(msg.Content)); err != nil {
-					fmt.Printf("Failed to broadcast message: %+v\n", err)
-				}
-			}
-			conns.RUnlock()
-		}
-	}()
-
-	router.Run(":8080")
 }
 
-func wshandler(w http.ResponseWriter, r *http.Request) {
-	// 升级连接为 WebSocket
+func (a *App) handleWebSocket(w http.ResponseWriter, r *http.Request) {
+	upgrader := websocket.Upgrader{
+		ReadBufferSize:  1024,
+		WriteBufferSize: 1024,
+		CheckOrigin: func(_ *http.Request) bool {
+			return true
+		},
+	}
+
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		fmt.Printf("Failed to set websocket upgrade: %+v\n", err)
 		return
 	}
+	defer conn.Close()
 
-	// 在这个位置获取客户端IP地址和用户名
-	ip := r.RemoteAddr
 	cookie, err := r.Cookie("username")
 	if err != nil {
 		fmt.Println("Error getting username from cookie:", err)
 		return
 	}
 	username := cookie.Value
+	ip := r.RemoteAddr
 
-	// 将新的 WebSocket 连接添加到映射中
-	conns.Lock()
-	conns.m[conn] = username
-	conns.Unlock()
+	a.mu.Lock()
+	a.conns[conn] = username
+	a.mu.Unlock()
 
-	// 在连接建立后发送在线用户列表
-	sendUserList()
+	a.sendUserList()
 
 	defer func() {
-		// 当连接断开时，从映射中移除
-		conns.Lock()
-		delete(conns.m, conn)
-		conns.Unlock()
-
-		// 在连接断开后发送在线用户列表
-		sendUserList()
+		a.mu.Lock()
+		delete(a.conns, conn)
+		a.mu.Unlock()
+		a.sendUserList()
 	}()
 
-	// 读取消息信息
 	for {
 		_, msg, err := conn.ReadMessage()
 		if err != nil {
 			break
 		}
-
+		content := strings.TrimSpace(string(msg))
+		if content == "" {
+			continue
+		}
 		message := UserMessage{
 			Sender:  username,
-			Content: fmt.Sprintf("%s (%s): %s", username, ip, string(msg)),
+			Content: content,
+			Display: formatMessage(username, ip, content),
 		}
+		a.msgChan <- message
 
-		// 将消息发送到全局消息通道
-		msgChan <- message
-
-		//fmt.Println(message.Content)
-		//fmt.Println(chatWithGPT(message.Content).Content)
-		chatWithGPT(string(msg))
-
+		go a.handleAIMessage(content)
 	}
-
 }
 
-func sendUserList() {
-	conns.RLock()
-	defer conns.RUnlock()
+func (a *App) handleAIMessage(content string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	response, err := a.aiClient.Chat(ctx, content)
+	if err != nil {
+		if a.aiClient.Enabled() {
+			response = "AI 服务暂时不可用，请稍后再试。"
+		} else {
+			response = "AI 服务未配置，请设置 OPENAI_API_KEY。"
+		}
+	}
+
+	message := UserMessage{
+		Sender:  "AI",
+		Content: response,
+		Display: formatMessage("AI", "0.0.0.0", response),
+	}
+	a.msgChan <- message
+}
+
+func (a *App) sendUserList() {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
 
 	var userList []string
-	for _, username := range conns.m {
+	for _, username := range a.conns {
 		userList = append(userList, username)
 	}
 
 	userListMessage := strings.Join(userList, ", ")
-	for conn := range conns.m {
+	for conn := range a.conns {
 		if err := conn.WriteMessage(websocket.TextMessage, []byte("Online users: "+userListMessage)); err != nil {
 			fmt.Printf("Failed to send user list: %+v\n", err)
 		}
 	}
 }
 
-//	func broadcast(username, ip, msg string) {
-//		conns.RLock()
-//		defer conns.RUnlock()
-//
-//		message := fmt.Sprintf("%s (%s): %s", username, ip, msg)
-//		for conn := range conns.m {
-//			if err := conn.WriteMessage(websocket.TextMessage, []byte(message)); err != nil {
-//				fmt.Printf("Failed to broadcast message: %+v\n", err)
-//			}
-//		}
-//	}
-func chatWithGPT(msg string) UserMessage {
-	reqBody := RequestBody{
-		Model: "gpt-3.5-turbo",
-		Messages: []Message{
-			{Role: "user", Content: msg},
-		},
-	}
-	payload, err := json.Marshal(reqBody)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	req, err := http.NewRequest("POST", openaiURL, bytes.NewBuffer(payload))
-	if err != nil {
-		log.Fatal(err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+openaiAPIKey)
-
-	proxyURL, err := url.Parse("http://localhost:7890") // Replace with your proxy server URL
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	client := &http.Client{
-		Transport: &http.Transport{
-			Proxy: http.ProxyURL(proxyURL),
-		},
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer resp.Body.Close()
-	fmt.Println("Response Status:", resp.Status)
-
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		log.Fatal(err)
-	}
-	fmt.Println("Response Body:", string(body))
-
-	var respBody ResponseBody
-	err = json.Unmarshal(body, &respBody)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	//fmt.Printf("ID: %s\n", respBody.ID)
-	//fmt.Printf("Object: %s\n", respBody.Object)
-	//fmt.Printf("Created: %d\n", respBody.Created)
-
-	message := UserMessage{"AI", respBody.Choices[0].Message.Content}
-	fmt.Println(msg)
-	for i, choice := range respBody.Choices {
-		fmt.Printf("Choice %d:\n", i)
-		fmt.Printf("  Index: %d\n", choice.Index)
-		fmt.Printf("  Finish Reason: %s\n", choice.FinishReason)
-		fmt.Printf("  Message Role: %s\n", choice.Message.Role)
-		fmt.Printf("  Message Content: %s\n", choice.Message.Content)
-
-		message = UserMessage{"AI", respBody.Choices[0].Message.Content}
-		messageofGPT := UserMessage{
-			Sender:  "AI",
-			Content: fmt.Sprintf("%s (%s): %s", "AI", "0.0.0.0", message),
+func (a *App) broadcastLoop() {
+	for msg := range a.msgChan {
+		if err := a.store.SaveMessage(context.Background(), msg.Sender, msg.Content); err != nil {
+			log.Printf("Failed to insert message to database: %v", err)
 		}
-		msgChan <- messageofGPT
+		a.mu.RLock()
+		for conn := range a.conns {
+			if err := conn.WriteMessage(websocket.TextMessage, []byte(msg.Display)); err != nil {
+				fmt.Printf("Failed to broadcast message: %+v\n", err)
+			}
+		}
+		a.mu.RUnlock()
 	}
-	//fmt.Printf("Usage:\n")
-	//fmt.Printf("  Prompt Tokens: %d\n", respBody.Usage.PromptTokens)
-	//fmt.Printf("  Completion Tokens: %d\n", respBody.Usage.CompletionTokens)
-	//fmt.Printf("  Total Tokens: %d\n", respBody.Usage.TotalTokens)
+}
 
-	//message := UserMessage{"AI", respBody.Choices[0].Message.Content}
+func (a *App) Run(addr string) error {
+	go a.broadcastLoop()
+	return a.router.Run(addr)
+}
 
-	return message
+func loadConfig() Config {
+	addr := os.Getenv("CHATROOM_ADDR")
+	if addr == "" {
+		addr = ":8080"
+	}
+
+	openAIURL := os.Getenv("OPENAI_API_URL")
+	if openAIURL == "" {
+		openAIURL = "https://api.openai.com/v1/chat/completions"
+	}
+	openAIModel := os.Getenv("OPENAI_MODEL")
+	if openAIModel == "" {
+		openAIModel = "gpt-3.5-turbo"
+	}
+
+	return Config{
+		Addr:        addr,
+		DBDSN:       os.Getenv("CHATROOM_DB_DSN"),
+		OpenAIKey:   os.Getenv("OPENAI_API_KEY"),
+		OpenAIURL:   openAIURL,
+		OpenAIModel: openAIModel,
+	}
+}
+
+func formatMessage(username, ip, message string) string {
+	return fmt.Sprintf("%s (%s): %s", username, ip, message)
+}
+
+func hashPassword(password string) (string, error) {
+	bytes, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		return "", err
+	}
+	return string(bytes), nil
+}
+
+func checkPassword(stored, provided string) bool {
+	if strings.HasPrefix(stored, "$2a$") || strings.HasPrefix(stored, "$2b$") || strings.HasPrefix(stored, "$2y$") {
+		return bcrypt.CompareHashAndPassword([]byte(stored), []byte(provided)) == nil
+	}
+	return stored == provided
+}
+
+func setUsernameCookie(c *gin.Context, username string) {
+	http.SetCookie(c.Writer, &http.Cookie{
+		Name:     "username",
+		Value:    username,
+		Path:     "/",
+		HttpOnly: true,
+	})
+}
+
+func main() {
+	cfg := loadConfig()
+
+	var store Store
+	if cfg.DBDSN != "" {
+		mysqlStore, err := NewMySQLStore(cfg.DBDSN)
+		if err != nil {
+			log.Fatalf("Failed to connect to MySQL: %v", err)
+		}
+		store = mysqlStore
+		log.Println("Connected to MySQL database.")
+	} else {
+		store = NewMemoryStore()
+		log.Println("Using in-memory store (set CHATROOM_DB_DSN to enable MySQL persistence).")
+	}
+
+	app := NewApp(store, NewOpenAIClient(cfg))
+	if err := app.Run(cfg.Addr); err != nil {
+		log.Fatalf("Failed to run server: %v", err)
+	}
 }
