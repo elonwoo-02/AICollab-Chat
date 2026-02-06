@@ -1,0 +1,25 @@
+---
+import BaseLayout from '../layouts/BaseLayout.astro';
+---
+<BaseLayout title="智聊协作平台">
+  <section class="card">
+    <h1>欢迎来到智聊协作平台</h1>
+    <p class="helper">
+      本项目已完成前后端分离，前端使用 Astro 构建，后端提供 API 与 WebSocket 服务。
+    </p>
+    <div class="footer-links">
+      <a class="button" href="/login">立即登录</a>
+      <a class="button secondary" href="/register">注册新账号</a>
+    </div>
+    <p class="helper" id="status"></p>
+  </section>
+  <script type="module">
+    const statusEl = document.getElementById('status');
+    const token = localStorage.getItem('authToken');
+    if (token) {
+      statusEl.textContent = '检测到已登录的会话，前往聊天室开始聊天吧。';
+    } else {
+      statusEl.textContent = '请先登录或注册账户以进入聊天室。';
+    }
+  </script>
+</BaseLayout>

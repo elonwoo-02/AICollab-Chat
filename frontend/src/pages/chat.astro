@@ -1,0 +1,92 @@
+---
+import BaseLayout from '../layouts/BaseLayout.astro';
+---
+<BaseLayout title="聊天室 | 智聊协作平台">
+  <section class="card">
+    <h1>聊天室</h1>
+    <p class="helper">当前在线用户及消息都会实时更新。</p>
+    <div class="chat-layout">
+      <div>
+        <div class="messages" id="messages"></div>
+        <form class="form" id="chat-form">
+          <div>
+            <label for="message">发送消息</label>
+            <textarea id="message" name="message" placeholder="输入消息并发送"></textarea>
+          </div>
+          <button class="button" type="submit">发送</button>
+          <div class="error" id="error" hidden></div>
+        </form>
+      </div>
+      <aside>
+        <h3>在线用户</h3>
+        <ul class="online-list" id="online-users"></ul>
+      </aside>
+    </div>
+  </section>
+  <script type="module">
+    const apiBase = import.meta.env.PUBLIC_API_BASE ?? 'http://localhost:8080';
+    const token = localStorage.getItem('authToken');
+    const username = localStorage.getItem('username');
+
+    if (!token) {
+      window.location.href = '/login';
+    }
+
+    const form = document.getElementById('chat-form');
+    const messageInput = document.getElementById('message');
+    const messagesEl = document.getElementById('messages');
+    const errorBox = document.getElementById('error');
+    const onlineEl = document.getElementById('online-users');
+
+    const apiUrl = new URL(apiBase);
+    const wsUrl = new URL('/api/ws', apiUrl);
+    wsUrl.protocol = apiUrl.protocol === 'https:' ? 'wss:' : 'ws:';
+    wsUrl.searchParams.set('token', token);
+
+    const socket = new WebSocket(wsUrl.toString());
+
+    socket.addEventListener('message', (event) => {
+      const text = event.data;
+      if (text.startsWith('Online users:')) {
+        const list = text.replace('Online users:', '').trim();
+        onlineEl.innerHTML = '';
+        if (!list) {
+          return;
+        }
+        list.split(',').map(name => name.trim()).filter(Boolean).forEach((name) => {
+          const li = document.createElement('li');
+          li.textContent = name === username ? `${name} (你)` : name;
+          onlineEl.appendChild(li);
+        });
+        return;
+      }
+
+      const messageItem = document.createElement('div');
+      messageItem.className = 'message';
+      const [sender, content] = text.split(': ');
+      messageItem.innerHTML = `<strong>${sender}</strong><span>${content ?? ''}</span>`;
+      messagesEl.appendChild(messageItem);
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+    });
+
+    socket.addEventListener('close', () => {
+      const messageItem = document.createElement('div');
+      messageItem.className = 'message';
+      messageItem.innerHTML = '<strong>系统</strong><span>连接已断开，请刷新页面重试。</span>';
+      messagesEl.appendChild(messageItem);
+    });
+
+    form.addEventListener('submit', (event) => {
+      event.preventDefault();
+      errorBox.hidden = true;
+      const content = messageInput.value.trim();
+      if (!content) {
+        errorBox.textContent = '请输入消息内容。';
+        errorBox.hidden = false;
+        return;
+      }
+      socket.send(content);
+      messageInput.value = '';
+    });
+  </script>
+</BaseLayout>

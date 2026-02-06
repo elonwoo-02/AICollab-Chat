@@ -33,7 +33,7 @@
 
 * AI对话支持：用户可以选择与AI进行聊天，AI返回的回答将显示在聊天室中。
 
-* 前端页面：聊天室需要一个漂亮的前端页面来增强用户体验。
+* 前端页面：前端已拆分为 Astro 应用，独立于 Go 后端运行。
 
 ### 程序文件
 
@@ -66,22 +66,16 @@
 ### 目录结构
 ``` arduino
 .
+├── frontend
+│   ├── src
+│   │   ├── layouts
+│   │   ├── pages
+│   │   └── styles
+│   └── package.json
 ├── main.go
 ├── main_test.go
 ├── readme.md
-├── 设计报告.pdf
-├── static
-│   ├── css
-│   │   └── ...
-│   ├── images
-│   │   └── avator.png
-│   └── js
-│       └── ...
-└── templates
-├── chat.html
-├── index.html
-├── login.html
-└── register.html
+└── 设计报告.pdf
 ```
 
 
@@ -115,9 +109,18 @@ export CHATROOM_DB_DSN="user:password@tcp(localhost:3306)/chatroom?parseTime=tru
 ```
 服务启动时会自动创建 `users` 和 `messages` 表（如不存在）。
 
-#### 添加静态文件
-如果你想在项目中添加自己的静态文件，确保你的静态文件（CSS、JavaScript、图片等）位于正确的目录中。
-代码将静态文件目录设置为./static，你还需要确保模板文件位于名为templates的目录中。
+#### 前端开发（Astro）
+前端独立在 `frontend/` 目录中，通过 Astro 构建。
+``` bash
+cd frontend
+npm install
+npm run dev
+```
+
+如需自定义 API 地址，可在启动前端时设置：
+``` bash
+export PUBLIC_API_BASE="http://localhost:8080"
+```
 
 #### api key
 通过环境变量提供 OpenAI Key：
@@ -129,18 +132,22 @@ export OPENAI_API_KEY="your_api_key"
 export OPENAI_API_URL="https://api.openai.com/v1/chat/completions"
 export OPENAI_MODEL="gpt-3.5-turbo"
 ```
+前端跨域访问可设置：
+``` bash
+export FRONTEND_ORIGIN="http://localhost:4321"
+```
 #### 编译运行
-1. 在浏览器中输入[http://localhost:8080](http://localhost:8080)查看是否正常启动；
-   ![./static/images/index.png](./static/images/index.png)
-2. 运行您的程序并尝试使用Web浏览器访问应用程序。首先访问[http://localhost:8080/register](http://localhost:8080/register), 尝试注册一个新用户；
-   ![./static/images/register.png](./static/images/register.png)
-3. 然后，访问[http://localhost:8080/register](http://localhost:8080/register), 尝试使用刚刚注册的用户登录。
-   ![./static/images/login.png](./static/images/login.png)
-   
-4. 开始[聊天](http://localhost:8080/chat) 
-   
-
-   ![./static/images/chat.png](./static/images/chat.png)
+1. 启动 Go 后端（默认 8080 端口）：
+   ``` bash
+   go run main.go
+   ```
+2. 启动 Astro 前端（默认 4321 端口）：
+   ``` bash
+   cd frontend
+   npm install
+   npm run dev
+   ```
+3. 在浏览器中访问 [http://localhost:4321](http://localhost:4321) 进行登录、注册与聊天。
 
 
 ### 后续更新

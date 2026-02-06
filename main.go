@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,11 +23,12 @@ import (
 )
 
 type Config struct {
-	Addr        string
-	DBDSN       string
-	OpenAIKey   string
-	OpenAIURL   string
-	OpenAIModel string
+	Addr           string
+	DBDSN          string
+	OpenAIKey      string
+	OpenAIURL      string
+	OpenAIModel    string
+	FrontendOrigin string
 }
 
 type UserMessage struct {
@@ -221,120 +224,59 @@ func (o *OpenAIClient) Chat(ctx context.Context, msg string) (string, error) {
 }
 
 type App struct {
-	router   *gin.Engine
-	store    Store
-	aiClient *OpenAIClient
-	msgChan  chan UserMessage
-	mu       sync.RWMutex
-	conns    map[*websocket.Conn]string
+	router         *gin.Engine
+	store          Store
+	aiClient       *OpenAIClient
+	msgChan        chan UserMessage
+	mu             sync.RWMutex
+	conns          map[*websocket.Conn]string
+	sessionsMu     sync.RWMutex
+	sessions       map[string]string
+	frontendOrigin string
 }
 
-func NewApp(store Store, aiClient *OpenAIClient) *App {
+func NewApp(store Store, aiClient *OpenAIClient, frontendOrigin string) *App {
 	if aiClient == nil {
 		aiClient = &OpenAIClient{}
 	}
+	if frontendOrigin == "" {
+		frontendOrigin = "http://localhost:4321"
+	}
 	app := &App{
-		router:   gin.Default(),
-		store:    store,
-		aiClient: aiClient,
-		msgChan:  make(chan UserMessage, 32),
-		conns:    make(map[*websocket.Conn]string),
+		router:         gin.Default(),
+		store:          store,
+		aiClient:       aiClient,
+		msgChan:        make(chan UserMessage, 32),
+		conns:          make(map[*websocket.Conn]string),
+		sessions:       make(map[string]string),
+		frontendOrigin: frontendOrigin,
 	}
 	app.registerRoutes()
 	return app
 }
 
 func (a *App) registerRoutes() {
-	a.router.LoadHTMLGlob("templates/*.html")
-	a.router.Static("/static", "./static")
+	a.router.Use(corsMiddleware(a.frontendOrigin))
 
-	a.router.GET("/", func(c *gin.Context) {
-		c.HTML(http.StatusOK, "index.html", nil)
+	api := a.router.Group("/api")
+	api.GET("/health", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"status": "ok"})
 	})
-
-	a.router.GET("/login", func(c *gin.Context) {
-		c.HTML(http.StatusOK, "login.html", nil)
-	})
-
-	a.router.POST("/login", func(c *gin.Context) {
-		username := strings.TrimSpace(c.PostForm("username"))
-		password := c.PostForm("password")
-
-		if username == "" || password == "" {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Username and password are required"})
-			return
-		}
-
-		storedPassword, err := a.store.GetUserPassword(c.Request.Context(), username)
-		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid username or password"})
-				return
-			}
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to query user information"})
-			return
-		}
-
-		if !checkPassword(storedPassword, password) {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid username or password"})
-			return
-		}
-
-		setUsernameCookie(c, username)
-		c.Redirect(http.StatusMovedPermanently, "/chat")
-	})
-
-	a.router.GET("/register", func(c *gin.Context) {
-		c.HTML(http.StatusOK, "register.html", nil)
-	})
-
-	a.router.POST("/register", func(c *gin.Context) {
-		username := strings.TrimSpace(c.PostForm("username"))
-		password := c.PostForm("password")
-		confirmPassword := c.PostForm("confirm_password")
-
-		if username == "" || password == "" || confirmPassword == "" {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Username and password are required"})
-			return
-		}
-		if password != confirmPassword {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Passwords do not match"})
-			return
-		}
-
-		passwordHash, err := hashPassword(password)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to secure password"})
-			return
-		}
-
-		if err := a.store.CreateUser(c.Request.Context(), username, passwordHash); err != nil {
-			if strings.Contains(err.Error(), "exists") {
-				c.JSON(http.StatusConflict, gin.H{"error": "User already exists"})
-				return
-			}
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to register user"})
-			return
-		}
-
-		setUsernameCookie(c, username)
-		c.Redirect(http.StatusMovedPermanently, "/chat")
-	})
-
-	a.router.GET("/chat", func(c *gin.Context) {
-		if _, err := c.Request.Cookie("username"); err != nil {
-			c.Redirect(http.StatusFound, "/login")
-			return
-		}
-		c.HTML(http.StatusOK, "chat.html", nil)
-	})
-
-	a.router.GET("/ws", func(c *gin.Context) {
+	api.POST("/login", a.handleLogin)
+	api.POST("/register", a.handleRegister)
+	api.GET("/me", a.authMiddleware, a.handleMe)
+	api.GET("/ws", func(c *gin.Context) {
 		a.handleWebSocket(c.Writer, c.Request)
 	})
 }
 
 func (a *App) handleWebSocket(w http.ResponseWriter, r *http.Request) {
+	token := r.URL.Query().Get("token")
+	username, ok := a.usernameForToken(token)
+	if !ok {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
 	upgrader := websocket.Upgrader{
 		ReadBufferSize:  1024,
 		WriteBufferSize: 1024,
@@ -350,12 +292,6 @@ func (a *App) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 	defer conn.Close()
 
-	cookie, err := r.Cookie("username")
-	if err != nil {
-		fmt.Println("Error getting username from cookie:", err)
-		return
-	}
-	username := cookie.Value
 	ip := r.RemoteAddr
 
 	a.mu.Lock()
@@ -388,6 +324,171 @@ func (a *App) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		a.msgChan <- message
 
 		go a.handleAIMessage(content)
+	}
+}
+
+type loginRequest struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+type registerRequest struct {
+	Username        string `json:"username"`
+	Password        string `json:"password"`
+	ConfirmPassword string `json:"confirmPassword"`
+}
+
+func (a *App) handleLogin(c *gin.Context) {
+	var req loginRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request"})
+		return
+	}
+	username := strings.TrimSpace(req.Username)
+	password := req.Password
+
+	if username == "" || password == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Username and password are required"})
+		return
+	}
+
+	storedPassword, err := a.store.GetUserPassword(c.Request.Context(), username)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid username or password"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to query user information"})
+		return
+	}
+
+	if !checkPassword(storedPassword, password) {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid username or password"})
+		return
+	}
+
+	token, err := a.createSession(username)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create session"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"token": token, "username": username})
+}
+
+func (a *App) handleRegister(c *gin.Context) {
+	var req registerRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request"})
+		return
+	}
+
+	username := strings.TrimSpace(req.Username)
+	password := req.Password
+	confirmPassword := req.ConfirmPassword
+
+	if username == "" || password == "" || confirmPassword == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Username and password are required"})
+		return
+	}
+	if password != confirmPassword {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Passwords do not match"})
+		return
+	}
+
+	passwordHash, err := hashPassword(password)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to secure password"})
+		return
+	}
+
+	if err := a.store.CreateUser(c.Request.Context(), username, passwordHash); err != nil {
+		if strings.Contains(err.Error(), "exists") {
+			c.JSON(http.StatusConflict, gin.H{"error": "User already exists"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to register user"})
+		return
+	}
+
+	token, err := a.createSession(username)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create session"})
+		return
+	}
+	c.JSON(http.StatusCreated, gin.H{"token": token, "username": username})
+}
+
+func (a *App) handleMe(c *gin.Context) {
+	username, ok := c.Get("username")
+	if !ok {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"username": username})
+}
+
+func (a *App) authMiddleware(c *gin.Context) {
+	token := extractBearerToken(c.GetHeader("Authorization"))
+	if token == "" {
+		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Authorization required"})
+		return
+	}
+	username, ok := a.usernameForToken(token)
+	if !ok {
+		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Invalid token"})
+		return
+	}
+	c.Set("username", username)
+	c.Next()
+}
+
+func (a *App) createSession(username string) (string, error) {
+	tokenBytes := make([]byte, 32)
+	if _, err := rand.Read(tokenBytes); err != nil {
+		return "", err
+	}
+	token := hex.EncodeToString(tokenBytes)
+
+	a.sessionsMu.Lock()
+	defer a.sessionsMu.Unlock()
+	for existingToken, existingUser := range a.sessions {
+		if existingUser == username {
+			delete(a.sessions, existingToken)
+		}
+	}
+	a.sessions[token] = username
+	return token, nil
+}
+
+func (a *App) usernameForToken(token string) (string, bool) {
+	if token == "" {
+		return "", false
+	}
+	a.sessionsMu.RLock()
+	defer a.sessionsMu.RUnlock()
+	username, ok := a.sessions[token]
+	return username, ok
+}
+
+func extractBearerToken(header string) string {
+	parts := strings.Fields(header)
+	if len(parts) == 2 && strings.EqualFold(parts[0], "Bearer") {
+		return parts[1]
+	}
+	return ""
+}
+
+func corsMiddleware(origin string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Writer.Header().Set("Access-Control-Allow-Origin", origin)
+		c.Writer.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		c.Writer.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+		c.Writer.Header().Set("Access-Control-Max-Age", "86400")
+		if c.Request.Method == http.MethodOptions {
+			c.AbortWithStatus(http.StatusNoContent)
+			return
+		}
+		c.Next()
 	}
 }
 
@@ -463,13 +564,18 @@ func loadConfig() Config {
 	if openAIModel == "" {
 		openAIModel = "gpt-3.5-turbo"
 	}
+	frontendOrigin := os.Getenv("FRONTEND_ORIGIN")
+	if frontendOrigin == "" {
+		frontendOrigin = "http://localhost:4321"
+	}
 
 	return Config{
-		Addr:        addr,
-		DBDSN:       os.Getenv("CHATROOM_DB_DSN"),
-		OpenAIKey:   os.Getenv("OPENAI_API_KEY"),
-		OpenAIURL:   openAIURL,
-		OpenAIModel: openAIModel,
+		Addr:           addr,
+		DBDSN:          os.Getenv("CHATROOM_DB_DSN"),
+		OpenAIKey:      os.Getenv("OPENAI_API_KEY"),
+		OpenAIURL:      openAIURL,
+		OpenAIModel:    openAIModel,
+		FrontendOrigin: frontendOrigin,
 	}
 }
 
@@ -492,15 +598,6 @@ func checkPassword(stored, provided string) bool {
 	return stored == provided
 }
 
-func setUsernameCookie(c *gin.Context, username string) {
-	http.SetCookie(c.Writer, &http.Cookie{
-		Name:     "username",
-		Value:    username,
-		Path:     "/",
-		HttpOnly: true,
-	})
-}
-
 func main() {
 	cfg := loadConfig()
 
@@ -517,7 +614,7 @@ func main() {
 		log.Println("Using in-memory store (set CHATROOM_DB_DSN to enable MySQL persistence).")
 	}
 
-	app := NewApp(store, NewOpenAIClient(cfg))
+	app := NewApp(store, NewOpenAIClient(cfg), cfg.FrontendOrigin)
 	if err := app.Run(cfg.Addr); err != nil {
 		log.Fatalf("Failed to run server: %v", err)
 	}
